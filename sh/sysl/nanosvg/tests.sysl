@@ -665,6 +665,39 @@ many_images()
         val img = parse(px100("<circle cx='50' cy='50' r='40'/><rect width='5' height='5'/>")).unwrap()
         assert_eq(img.shapes().len(), 2)
 
+@test("dropping an image gives back every block nanosvg took")
+drop_frees_the_tree()
+    val base = live_blocks()
+    for i in 0..<200
+        val img = parse(px100("<circle cx='50' cy='50' r='40'/><path d='M0 0 L5 5 Z M1 1 L6 6 Z'/>")).unwrap()
+        assert(live_blocks() > base)
+        assert_eq(img.shapes().len(), 2)
+    assert_eq(live_blocks(), base)
+
+@test("a failed or empty parse leaves nothing behind either")
+no_blocks_after_empty_parses()
+    val base = live_blocks()
+    for i in 0..<50
+        parse("").err()
+        parse("<svg/>").unwrap()
+        parse("<svg><path d='M0'/></svg>").unwrap()
+    assert_eq(live_blocks(), base)
+
+private shapes_outliving_the_handle() -> Buf[Shape]
+    // The image handle goes out of scope on return; the shapes returned hold it.
+    val img = parse(px100("<rect id='kept' width='3' height='4'/>")).unwrap()
+    img.shapes()
+
+@test("a shape keeps its image alive after the handle is gone")
+shape_keeps_image_alive()
+    val base = live_blocks()
+    val shapes = shapes_outliving_the_handle()
+    assert(live_blocks() > base, "the tree must still be allocated")
+    assert_eq(shapes[0].id(), "kept")
+    val b = shapes[0].bounds()
+    assert(near(f64(b.max_x), 3.0, 1e-4) && near(f64(b.max_y), 4.0, 1e-4))
+    assert_eq(shapes[0].paths()[0].count(), 13)
+
 @test("two images are independent")
 two_images()
     val a = parse(px100("<rect id='a' width='10' height='10'/>")).unwrap()

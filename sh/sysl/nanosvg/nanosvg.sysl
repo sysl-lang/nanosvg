@@ -341,6 +341,10 @@ end Outline
 
 // ## Parsing
 
+// How many blocks nanosvg holds right now, across every image in the process. Zero when none is
+// alive; it exists so that a test can say a dropped image gave everything back.
+live_blocks() -> i64 = c.live_blocks()
+
 private has_svg(data: []const u8) -> bool
     // `<svg`, byte by byte: 60 115 118 103.
     if data.len < 4 then return false

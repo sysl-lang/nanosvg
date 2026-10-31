@@ -65,6 +65,9 @@ Requires sysl 0.8.6 and `heap`. Links `-lm`.
 - **`Path`**: `closed()`, `segments()`, `points()` (the raw `x, y` floats, a view), `point(i)`,
   `bezier(i)` (four control points), `bounds()`, `flatten(tolerance)`.
 - **`Outline`**: the result of flattening: `points`, `closed`, `area()` (signed), `perimeter()`.
+- **`live_blocks()`**: how many blocks nanosvg holds right now. `shim.c` counts its `malloc`,
+  `realloc` and `free` (by macro, in its own translation unit; the header is untouched) so that a
+  test can say a dropped image gave everything back.
 
 A `Shape` or `Path` holds the `&Image` it came from, so the tree outlives every view of it. A
 `points()` slice is a view into the tree and lives as long as the `Path` that returned it.
@@ -163,6 +166,10 @@ SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 
 The second reports `instrumented: address (1 binary)`, and because the C is in this tree the flag
 compiles nanosvg itself, not only the sysl half.
+
+**One property is only checked under ASan**: that `parse` terminates its private copy of the input.
+Without the terminator, `sysl test .` still passes (the byte after the copy happens to be zero here),
+and the ASan run fails every parse with a `heap-buffer-overflow` in `nsvg__parseXML`.
 
 The oracle is geometry: a circle's area and perimeter against closed form, with a tighter tolerance
 giving more points and less error; a triangle, a quadratic arch (two thirds of base times height) and

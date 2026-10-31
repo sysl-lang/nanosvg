@@ -11,9 +11,53 @@
  * header that nothing checks. An accessor is checked by the C compiler against the real struct.
  */
 
+/* **Every block nanosvg allocates is counted**, so a test can say that dropping an image gave all of
+ * them back. nanosvg calls `malloc`, `realloc` and `free` directly and has no allocator hook, so the
+ * three are redefined for this translation unit only, after the system headers have declared them
+ * and before nanosvg's body is read. The header itself stays byte for byte upstream's. */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+static long long g_live_blocks = 0;
+
+static void *counted_malloc(size_t n)
+{
+    void *p = malloc(n);
+    if (p) __atomic_fetch_add(&g_live_blocks, 1, __ATOMIC_RELAXED);
+    return p;
+}
+
+static void *counted_realloc(void *old, size_t n)
+{
+    void *p = realloc(old, n);
+    if (p && !old) __atomic_fetch_add(&g_live_blocks, 1, __ATOMIC_RELAXED);
+    return p;
+}
+
+static void counted_free(void *p)
+{
+    if (p) __atomic_fetch_sub(&g_live_blocks, 1, __ATOMIC_RELAXED);
+    free(p);
+}
+
+#define malloc(n) counted_malloc(n)
+#define realloc(p, n) counted_realloc(p, n)
+#define free(p) counted_free(p)
+
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg.h"
 #include "shim.h"
+
+#undef malloc
+#undef realloc
+#undef free
+
+long long sysl_nsvg_live_blocks(void)
+{
+    return __atomic_load_n(&g_live_blocks, __ATOMIC_RELAXED);
+}
 
 NSVGimage *sysl_nsvg_parse(char *input, int units, float dpi)
 {

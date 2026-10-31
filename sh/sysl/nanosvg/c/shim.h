@@ -24,6 +24,9 @@
  * NUL-terminated and is edited in place. Answers null when nanosvg could not allocate. */
 NSVGimage *sysl_nsvg_parse(char *input, int units, float dpi);
 
+/* How many blocks nanosvg has allocated and not yet freed, across every image. */
+long long sysl_nsvg_live_blocks(void);
+
 float sysl_nsvg_image_width(const NSVGimage *image);
 float sysl_nsvg_image_height(const NSVGimage *image);
 NSVGshape *sysl_nsvg_image_shapes(const NSVGimage *image);

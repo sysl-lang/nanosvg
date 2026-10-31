@@ -71,6 +71,9 @@ extern "sysl_nsvg_parse" parse(input: *u8, units: int, dpi: f32) -> *Image
 // Frees the image and every shape and path in it.
 extern "nsvgDelete" delete(image: *Image) -> unit
 
+// How many blocks nanosvg holds right now, across every image: zero when nothing is parsed.
+extern "sysl_nsvg_live_blocks" live_blocks() -> i64
+
 extern "sysl_nsvg_image_width" image_width(image: *Image) -> f32
 extern "sysl_nsvg_image_height" image_height(image: *Image) -> f32
 extern "sysl_nsvg_image_shapes" image_shapes(image: *Image) -> *Shape
