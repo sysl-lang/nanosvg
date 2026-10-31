@@ -1,0 +1,851 @@
+module sh.sysl.nanosvg
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{max, min}
+
+// What this binding claims, run by `sysl test .`.
+//
+// ==The oracle is geometry, not nanosvg==
+//
+// A parser tested against its own output agrees with itself. So the numbers below come from
+// somewhere else: a circle's area and perimeter from the closed forms, a triangle's from its
+// vertices, the SVG 1.1 specification's own path examples (paths.html) worked by hand, and the
+// flattening's central promise -- that the polyline stays within the tolerance of the curve -- from
+// sampling the curve densely and measuring the distance to the polyline, which uses neither
+// nanosvg's numbers nor the flattener's.
+//
+// ==Fixtures are written with single-quoted attributes==
+//
+// to keep the XML readable inside sysl string literals; nanosvg accepts both.
+
+private near(a: f64, b: f64, tol: f64) -> bool = (a - b).abs() <= tol
+
+private near_rel(a: f64, b: f64, rel: f64) -> bool = (a - b).abs() <= rel * max(a.abs(), b.abs())
+
+// A document with an explicit size and viewBox, so the user units are the pixels and nothing is
+// re-centred on the content.
+private doc(w: string, h: string, view: string, body: string) -> string =
+    "<svg width='" + w + "' height='" + h + "' viewBox='" + view + "'>" + body + "</svg>"
+
+private px100(body: string) -> string = doc("100", "100", "0 0 100 100", body)
+
+// The first shape's outlines at `tol`, in the document's units.
+private outlines_of(svg: string, units: Units, dpi: f32, tol: f64) -> Buf[Outline]
+    val img = parse(svg, units, dpi).unwrap()
+    val shapes = img.shapes()
+    shapes[0].flatten(tol).unwrap()
+
+private first_outline(svg: string, tol: f64) -> Outline = outlines_of(svg, Units.Px, 96, tol)[0]
+
+// -- Parsing -----------------------------------------------------------------------------------
+
+@test("a rect parses to one closed path of four segments")
+rect_parses()
+    val img = parse("<svg width='10' height='20'><rect width='10' height='20'/></svg>").unwrap()
+    assert_eq(img.width, 10.0)
+    assert_eq(img.height, 20.0)
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 1)
+    val ps = shapes[0].paths()
+    assert_eq(ps.len(), 1)
+    assert_eq(ps[0].count(), 13)
+    assert_eq(ps[0].segments(), 4)
+    assert(ps[0].closed())
+
+@test("the points are in document order: start, two controls, end, per segment")
+points_in_order()
+    val img = parse(px100("<path d='M10 20 C 30 40, 50 60, 70 80'/>")).unwrap()
+    val p = img.shapes()[0].paths()[0]
+    assert_eq(p.count(), 4)
+    assert(!p.closed())
+    assert_slice_eq(p.points(), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0])
+    val s = p.bezier(0)
+    assert_eq(s.p0.x, 10.0)
+    assert_eq(s.p1.y, 40.0)
+    assert_eq(s.p2.x, 50.0)
+    assert_eq(s.p3.y, 80.0)
+    assert_eq(p.point(2).x, 50.0)
+
+@test("shapes come back in document order, with their ids")
+shapes_in_order_with_ids()
+    val img = parse(px100("<rect id='a' width='1' height='1'/><rect id='b' x='5' width='1' height='1'/><circle id='c' cx='50' cy='50' r='3'/>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 3)
+    assert_eq(shapes[0].id(), "a")
+    assert_eq(shapes[1].id(), "b")
+    assert_eq(shapes[2].id(), "c")
+
+@test("a shape inherits its group's id, and an id is cut to 63 bytes")
+group_id_and_long_id()
+    val img = parse(px100("<g id='grp'><rect width='1' height='1'/></g><rect id='" +
+                          "0123456789012345678901234567890123456789012345678901234567890123456789" +
+                          "' width='1' height='1'/><rect width='1' height='1'/>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 3)
+    assert_eq(shapes[0].id(), "grp")
+    assert_eq(shapes[1].id().len, 63)
+    assert_eq(shapes[2].id(), "")
+
+@test("fill, stroke, opacity and stroke settings arrive as written")
+paint_and_stroke()
+    val img = parse(px100("<rect id='r' width='10' height='10' fill='#ff8000' stroke='#0000ff' " +
+                          "stroke-width='2' opacity='0.5' stroke-linejoin='round' " +
+                          "stroke-linecap='square' stroke-miterlimit='7' " +
+                          "stroke-dasharray='4 2' stroke-dashoffset='1'/>")).unwrap()
+    val s = img.shapes()[0]
+    assert_eq(s.fill(), Paint.Solid(Color(255, 128, 0, 255)))
+    assert_eq(s.stroke(), Paint.Solid(Color(0, 0, 255, 255)))
+    assert_eq(s.opacity(), 0.5)
+    assert_eq(s.stroke_width(), 2.0)
+    assert_eq(s.line_join(), LineJoin.Round)
+    assert_eq(s.line_cap(), LineCap.Square)
+    assert_eq(s.miter_limit(), 7.0)
+    assert_eq(s.dash_offset(), 1.0)
+    assert_slice_eq(s.dashes().view(), [4.0, 2.0])
+    assert(s.visible())
+
+@test("the defaults are a black fill, no stroke, a miter join and a butt cap")
+paint_defaults()
+    val s = parse(px100("<rect width='10' height='10'/>")).unwrap().shapes()[0]
+    assert_eq(s.fill(), Paint.Solid(Color(0, 0, 0, 255)))
+    assert_eq(s.stroke(), Paint.None)
+    assert_eq(s.opacity(), 1.0)
+    assert_eq(s.line_join(), LineJoin.Miter)
+    assert_eq(s.line_cap(), LineCap.Butt)
+    assert_eq(s.fill_rule(), FillRule.NonZero)
+    assert_eq(s.dashes().len(), 0)
+
+@test("fill-opacity lands in the alpha channel, fill none is None, and a gradient is reported")
+paint_alpha_none_gradient()
+    val img = parse(px100("<defs><linearGradient id='g'><stop offset='0' stop-color='red'/>" +
+                          "<stop offset='1' stop-color='blue'/></linearGradient>" +
+                          "<radialGradient id='h'><stop offset='0' stop-color='red'/>" +
+                          "<stop offset='1' stop-color='blue'/></radialGradient></defs>" +
+                          "<rect width='1' height='1' fill='#00ff00' fill-opacity='0.5'/>" +
+                          "<rect width='1' height='1' fill='none'/>" +
+                          "<rect width='1' height='1' fill='url(#g)'/>" +
+                          "<rect width='1' height='1' fill='url(#h)'/>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 4)
+    // nanosvg truncates 0.5 * 255 to 127.
+    assert_eq(shapes[0].fill(), Paint.Solid(Color(0, 255, 0, 127)))
+    assert_eq(shapes[1].fill(), Paint.None)
+    assert_eq(shapes[2].fill(), Paint.LinearGradient)
+    assert_eq(shapes[3].fill(), Paint.RadialGradient)
+
+@test("a display:none shape is kept and flagged, and so is everything in a hidden group")
+visibility()
+    val img = parse(px100("<rect id='h' width='1' height='1' display='none'/>" +
+                          "<rect id='v' width='1' height='1'/>" +
+                          "<rect id='s' width='1' height='1' style='display:none'/>" +
+                          "<g display='none'><rect id='g' width='1' height='1'/></g>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 4)
+    assert_eq(shapes[0].id(), "h")
+    assert(!shapes[0].visible())
+    assert(shapes[1].visible())
+    assert(!shapes[2].visible())
+    assert(!shapes[3].visible())
+
+@test("visibility:hidden is not something nanosvg reads, so the shape stays visible")
+visibility_hidden_is_ignored()
+    // A limitation of nanosvg, pinned so that a fix upstream shows up here.
+    val img = parse(px100("<rect width='1' height='1' visibility='hidden'/>")).unwrap()
+    assert(img.shapes()[0].visible())
+
+@test("colours: hex short and long, rgb(), the ten names, and a name nanosvg does not know")
+colour_forms()
+    val img = parse(px100("<rect width='1' height='1' fill='#f80'/>" +
+                          "<rect width='1' height='1' fill='#102030'/>" +
+                          "<rect width='1' height='1' fill='rgb(10,20,30)'/>" +
+                          "<rect width='1' height='1' fill='rgb(100%,0%,50%)'/>" +
+                          "<rect width='1' height='1' fill='red'/>" +
+                          "<rect width='1' height='1' fill='orange'/>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes[0].fill(), Paint.Solid(Color(255, 136, 0, 255)))
+    assert_eq(shapes[1].fill(), Paint.Solid(Color(16, 32, 48, 255)))
+    assert_eq(shapes[2].fill(), Paint.Solid(Color(10, 20, 30, 255)))
+    assert_eq(shapes[3].fill(), Paint.Solid(Color(255, 0, 128, 255)))
+    assert_eq(shapes[4].fill(), Paint.Solid(Color(255, 0, 0, 255)))
+    // `orange` is only in nanosvg's table when NANOSVG_ALL_COLOR_KEYWORDS is set, which it is not.
+    assert_eq(shapes[5].fill(), Paint.Solid(Color(128, 128, 128, 255)))
+
+@test("fill-rule is preserved on the shape, and inherited from a group")
+fill_rule_preserved()
+    val img = parse(px100("<path fill-rule='evenodd' d='M10 10 H90 V90 H10 Z'/>" +
+                          "<path fill-rule='nonzero' d='M10 10 H90 V90 H10 Z'/>" +
+                          "<g fill-rule='evenodd'><path d='M10 10 H90 V90 H10 Z'/></g>" +
+                          "<path d='M10 10 H90 V90 H10 Z'/>")).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes[0].fill_rule(), FillRule.EvenOdd)
+    assert_eq(shapes[1].fill_rule(), FillRule.NonZero)
+    assert_eq(shapes[2].fill_rule(), FillRule.EvenOdd)
+    assert_eq(shapes[3].fill_rule(), FillRule.NonZero)
+
+@test("a path with an inner subpath is one shape with two paths, and the rule survives")
+hole()
+    val body = "<path fill-rule='evenodd' d='M10 10 H90 V90 H10 Z M30 30 H70 V70 H30 Z'/>"
+    val img = parse(px100(body)).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes.len(), 1)
+    assert_eq(shapes[0].fill_rule(), FillRule.EvenOdd)
+    val outs = shapes[0].flatten(0.1).unwrap()
+    assert_eq(outs.len(), 2)
+    // Both squares are wound the same way: 80 x 80 and 40 x 40.
+    val a0 = outs[0].area().abs()
+    val a1 = outs[1].area().abs()
+    assert(near(max(a0, a1), 6400.0, 0.01))
+    assert(near(min(a0, a1), 1600.0, 0.01))
+    assert((outs[0].area() > 0.0) == (outs[1].area() > 0.0))
+    assert(outs[0].closed && outs[1].closed)
+
+@test("a hole wound the other way has the opposite sign, which is how nonzero finds it")
+hole_winding()
+    val body = "<path d='M10 10 H90 V90 H10 Z M30 30 V70 H70 V30 Z'/>"
+    val img = parse(px100(body)).unwrap()
+    val shapes = img.shapes()
+    assert_eq(shapes[0].fill_rule(), FillRule.NonZero)
+    val outs = shapes[0].flatten(0.1).unwrap()
+    assert_eq(outs.len(), 2)
+    assert((outs[0].area() > 0.0) != (outs[1].area() > 0.0))
+    assert(near(outs[0].area() + outs[1].area(), 6400.0 - 1600.0, 0.01) ||
+           near(outs[0].area() + outs[1].area(), -(6400.0 - 1600.0), 0.01))
+
+@test("transform is applied: translate then scale, and a rotation")
+transforms_applied()
+    val t = parse(px100("<rect transform='translate(5 7) scale(2)' width='10' height='10'/>")).unwrap()
+    val b = t.shapes()[0].bounds()
+    assert(near(f64(b.min_x), 5.0, 1e-4) && near(f64(b.min_y), 7.0, 1e-4))
+    assert(near(f64(b.max_x), 25.0, 1e-4) && near(f64(b.max_y), 27.0, 1e-4))
+
+    // A quarter turn about the origin takes (x, y) to (-y, x): the 10 x 20 box at (30, 0) lands at
+    // x in [-20, 0], y in [30, 40]; translated by 50 so it stays inside the page.
+    val r = parse(px100("<rect transform='translate(50 0) rotate(90)' x='30' y='0' width='10' height='20'/>")).unwrap()
+    val rb = r.shapes()[0].bounds()
+    assert(near(f64(rb.min_x), 30.0, 1e-3) && near(f64(rb.max_x), 50.0, 1e-3))
+    assert(near(f64(rb.min_y), 30.0, 1e-3) && near(f64(rb.max_y), 40.0, 1e-3))
+
+    // The flattened outline carries it too.
+    val o = first_outline(px100("<rect transform='translate(5 7) scale(2)' width='10' height='10'/>"), 0.1)
+    assert(near(o.area(), 400.0, 1e-3))
+
+@test("a group's transform applies to what is inside it")
+group_transform()
+    val o = first_outline(px100("<g transform='translate(10 10)'><rect width='10' height='10'/></g>"), 0.1)
+    assert(near(o.points[0].x, 10.0, 1e-4) && near(o.points[0].y, 10.0, 1e-4))
+    assert(near(o.area(), 100.0, 1e-3))
+
+// -- Units: a printed part has to come out at its real size --------------------------------------
+
+@test("10mm in millimetres is 10, whatever the dpi")
+ten_mm_is_ten()
+    val svg = doc("10mm", "10mm", "0 0 10 10", "<rect width='10' height='10'/>")
+    for dpi in [72.0, 96.0, 300.0, 25.4]
+        val img = parse(svg, Units.Mm, f32(dpi)).unwrap()
+        assert(near(f64(img.width), 10.0, 1e-3))
+        assert(near(f64(img.height), 10.0, 1e-3))
+        val b = img.shapes()[0].bounds()
+        assert(near(f64(b.min_x), 0.0, 1e-3) && near(f64(b.max_x), 10.0, 1e-3))
+        assert(near(f64(b.max_y), 10.0, 1e-3))
+
+@test("the same file in other units: inches, centimetres, points, pixels")
+same_file_other_units()
+    // 2.54 cm is one inch is 72 pt is 96 px at 96 dpi, and the rect fills the page.
+    val svg = doc("2.54cm", "2.54cm", "0 0 10 10", "<rect width='10' height='10'/>")
+    val inch = parse(svg, Units.In, 96).unwrap()
+    val cm = parse(svg, Units.Cm, 96).unwrap()
+    val pt = parse(svg, Units.Pt, 96).unwrap()
+    val px = parse(svg, Units.Px, 96).unwrap()
+    val mm = parse(svg, Units.Mm, 96).unwrap()
+    assert(near(f64(inch.width), 1.0, 1e-4))
+    assert(near(f64(cm.width), 2.54, 1e-4))
+    assert(near(f64(pt.width), 72.0, 1e-3))
+    assert(near(f64(px.width), 96.0, 1e-3))
+    assert(near(f64(mm.width), 25.4, 1e-3))
+    assert(near(f64(mm.shapes()[0].bounds().max_x), 25.4, 1e-3))
+    assert(near(f64(inch.shapes()[0].bounds().max_x), 1.0, 1e-4))
+
+@test("a file in inches read in millimetres")
+inches_to_mm()
+    val svg = doc("2in", "1in", "0 0 200 100", "<rect width='200' height='100'/>")
+    val img = parse(svg, Units.Mm, 96).unwrap()
+    assert(near(f64(img.width), 50.8, 1e-3))
+    assert(near(f64(img.height), 25.4, 1e-3))
+    val o = outlines_of(svg, Units.Mm, 96, 0.01)[0]
+    assert(near(o.area(), 50.8 * 25.4, 1e-2))
+
+@test("unitless numbers are CSS pixels, so they depend on the dpi")
+unitless_depends_on_dpi()
+    // No width, height or viewBox: 100 user units are 100 px.
+    val svg = "<svg><rect width='100' height='100'/></svg>"
+    val at96 = parse(svg, Units.Mm, 96).unwrap()
+    assert(near(f64(at96.width), 100.0 * 25.4 / 96.0, 1e-3))
+    // Pass 25.4 and a bare number is a millimetre.
+    val at254 = parse(svg, Units.Mm, 25.4).unwrap()
+    assert(near(f64(at254.width), 100.0, 1e-3))
+    assert(near(f64(at254.shapes()[0].bounds().max_x), 100.0, 1e-3))
+
+@test("a stroke width is scaled into the same units")
+stroke_scaled_with_units()
+    val svg = doc("10mm", "10mm", "0 0 10 10", "<rect width='10' height='10' stroke='black' stroke-width='1'/>")
+    val s = parse(svg, Units.Mm, 96).unwrap().shapes()[0]
+    assert(near(f64(s.stroke_width()), 1.0, 1e-3))
+
+// -- Error paths and hostile input -----------------------------------------------------------------
+
+@test("an empty string is not an SVG")
+empty_is_not_svg()
+    assert_eq(parse("").err(), Some(Error.NotSvg))
+    assert_eq(parse_bytes([]).err(), Some(Error.NotSvg))
+
+@test("text that is not an SVG is refused")
+not_svg()
+    assert_eq(parse("hello, world").err(), Some(Error.NotSvg))
+    assert_eq(parse("<html><body>hi</body></html>").err(), Some(Error.NotSvg))
+    assert_eq(parse("<sv").err(), Some(Error.NotSvg))
+    assert_eq(parse("<svg").is_ok(), true)
+
+@test("an SVG with nothing in it is an image with no shapes")
+no_shapes()
+    val img = parse("<svg width='5' height='6'></svg>").unwrap()
+    assert_eq(img.shapes().len(), 0)
+    assert_eq(img.width, 5.0)
+    assert_eq(img.height, 6.0)
+
+@test("a truncated document parses to what was complete")
+truncated()
+    val full = "<svg width='10' height='10'><rect width='5' height='5'/><rect width='6' height='6'/></svg>"
+    // Every prefix that still holds the `<svg` parses without a fault; the count never exceeds
+    // the two shapes there are.
+    for n in 4..<full.len
+        val img = parse(full[0..<n]).unwrap()
+        assert(img.shapes().len() <= 2)
+    assert_eq(parse(full[0..<60]).unwrap().shapes().len(), 1)
+
+@test("a path cut off mid-command keeps the part that was whole")
+truncated_path()
+    val img = parse(px100("<path d='M10 10 L50 10 L50 50 L")).unwrap()
+    for s in img.shapes()
+        for o in s.flatten(0.1).unwrap()
+            assert(o.points.len() >= 1)
+
+@test("the input is copied and terminated: a slice of a longer string stops where the slice does")
+slice_of_longer_string()
+    // The tail holds a second rect. Were the copy not NUL-terminated at the slice's end, nanosvg
+    // would run on into it and find two shapes; a literal could never show this, since only a
+    // literal is followed by a zero.
+    val whole = "<svg width='10' height='10'><rect width='5' height='5'/></svg><rect id='tail' width='1' height='1'/>"
+    val cut = whole[0..<62]
+    val img = parse(cut).unwrap()
+    assert_eq(img.shapes().len(), 1)
+    val bytes = whole.bytes
+    val img2 = parse_bytes(bytes[0..<62]).unwrap()
+    assert_eq(img2.shapes().len(), 1)
+    // The caller's string is untouched: nanosvg edited a copy.
+    assert_eq(cut, "<svg width='10' height='10'><rect width='5' height='5'/></svg>")
+    assert_eq(whole.len, 100)
+    assert_eq(parse(whole).unwrap().shapes().len(), 2)
+
+@test("a long input outgrows the copy's capacity and still parses")
+long_input()
+    var b: Buf[u8] = buf()
+    b.extend("<svg width='100' height='100'>".bytes)
+    for i in 0..<3000
+        b.extend("<rect width='1' height='1'/>".bytes)
+    b.extend("</svg>".bytes)
+    val img = parse_bytes(b.view()).unwrap()
+    assert_eq(img.shapes().len(), 3000)
+
+@test("deep nesting does not overflow anything")
+deep_nesting()
+    var b: Buf[u8] = buf()
+    b.extend("<svg width='100' height='100'>".bytes)
+    for i in 0..<20000
+        b.extend("<g transform='translate(1 0)'>".bytes)
+    b.extend("<rect id='deep' width='1' height='1'/>".bytes)
+    for i in 0..<20000
+        b.extend("</g>".bytes)
+    b.extend("</svg>".bytes)
+    val img = parse_bytes(b.view()).unwrap()
+    assert_eq(img.shapes().len(), 1)
+    assert_eq(img.shapes()[0].id(), "deep")
+
+@test("deep nesting of the unclosed kind")
+deep_nesting_unclosed()
+    var b: Buf[u8] = buf()
+    b.extend("<svg width='100' height='100'>".bytes)
+    for i in 0..<20000
+        b.extend("<g><g".bytes)
+    val img = parse_bytes(b.view()).unwrap()
+    assert_eq(img.shapes().len(), 0)
+
+@test("huge and non-finite numbers parse without a fault, and flatten finishes")
+huge_numbers()
+    val bodies = ["<rect x='1e38' y='1e38' width='1e38' height='1e38'/>",
+                  "<rect width='1e400' height='1e400'/>",
+                  "<path d='M0 0 L 1e999 1e999 L 5 5 Z'/>",
+                  "<path d='M0 0 C 1e30 0 0 1e30 1e30 1e30'/>",
+                  "<path d='M0 0 C 1e300 0 0 1e300 1e300 1e300'/>",
+                  "<path d='M-1e38 -1e38 L 1e38 1e38'/>",
+                  "<circle cx='1e39' cy='0' r='1e39'/>",
+                  "<path d='M99999999999999999999999999999999999999999999999999999999999999999999 0 L 1 1'/>",
+                  "<path d='M0 0 L 1e-400 1e-400 L 0.0000000000000000000000000000000000001 0'/>",
+                  "<rect width='-5' height='-5'/>",
+                  "<rect width='nan' height='inf'/>"]
+    for body in bodies
+        val img = parse(px100(body)).unwrap()
+        for s in img.shapes()
+            for o in s.flatten(0.01).unwrap()
+                assert(o.points.len() < 2000000)
+
+@test("a path with a single point or no data draws nothing")
+empty_paths()
+    for body in ["<path d=''/>", "<path/>", "<path d='M10 10'/>", "<path d='M10 10 Z'/>",
+                 "<path d='M10 10 L10 10'/>", "<polyline points=''/>", "<polygon points='5 5'/>"]
+        val img = parse(px100(body)).unwrap()
+        for s in img.shapes()
+            for o in s.flatten(0.1).unwrap()
+                // Whatever survives is a degenerate outline with zero area.
+                assert(near(o.area(), 0.0, 1e-9))
+
+@test("an open path stays open: three vertices, not closed, and its length is two edges")
+open_path()
+    val o = first_outline(px100("<path fill='none' d='M10 10 L50 10 L50 50'/>"), 0.1)
+    assert(!o.closed)
+    assert_eq(o.points.len(), 3)
+    assert(near(o.perimeter(), 80.0, 1e-4))
+    // Filling closes it by the chord, so the area is the triangle's.
+    assert(near(o.area().abs(), 800.0, 1e-3))
+
+@test("a closed path does not repeat its first point")
+closed_path()
+    val o = first_outline(px100("<path d='M10 10 L50 10 L50 50 Z'/>"), 0.1)
+    assert(o.closed)
+    assert_eq(o.points.len(), 3)
+    assert(near(o.perimeter(), 40.0 + 40.0 + 40.0 * 2.0.sqrt(), 1e-4))
+    // A path whose last point already is the first, closed anyway, still has no repeat.
+    val q = first_outline(px100("<path d='M10 10 L50 10 L50 50 L10 10 Z'/>"), 0.1)
+    assert(q.closed)
+    assert_eq(q.points.len(), 3)
+
+@test("a zero-length edge is dropped")
+zero_length_edge()
+    val o = first_outline(px100("<path d='M10 10 L10 10 L50 10 L50 10 L50 50 Z'/>"), 0.1)
+    assert_eq(o.points.len(), 3)
+
+@test("an unrecognised path command leaves what came before it")
+bad_command()
+    val img = parse(px100("<path d='M10 10 L50 10 L50 50 X 5 5'/>")).unwrap()
+    for s in img.shapes()
+        for o in s.flatten(0.1).unwrap()
+            assert(o.points.len() >= 1)
+
+// -- Flattening: the central promise ----------------------------------------------------------------
+
+@test("a tolerance that is not a positive number is refused")
+bad_tolerance()
+    val img = parse(px100("<circle cx='50' cy='50' r='40'/>")).unwrap()
+    val s = img.shapes()[0]
+    assert_eq(s.flatten(0.0).err(), Some(Error.BadTolerance))
+    assert_eq(s.flatten(-1.0).err(), Some(Error.BadTolerance))
+    assert_eq(s.flatten(0.0 / 0.0).err(), Some(Error.BadTolerance))
+    assert_eq(s.paths()[0].flatten(0.0).err(), Some(Error.BadTolerance))
+
+@test("a circle's area and perimeter match the closed forms, and tighter is more points and less error")
+circle_oracle()
+    val r = 40.0
+    val pi = 3.141592653589793
+    val area = pi * r * r
+    val perimeter = 2.0 * pi * r
+    val svg = px100("<circle cx='50' cy='50' r='40'/>")
+    var last_count = 0
+    var last_area_err = 1.0e9
+    var last_perim_err = 1.0e9
+    for tol in [4.0, 1.0, 0.25, 0.05]
+        val o = first_outline(svg, tol)
+        assert(o.closed)
+        val n = o.points.len()
+        val area_err = (o.area().abs() - area).abs()
+        val perim_err = (o.perimeter() - perimeter).abs()
+        // More points, strictly, for every tightening.
+        assert(n > last_count, "a tighter tolerance must give more points")
+        // The segments' sagitta is within the tolerance, so the area the polygon misses is at most
+        // the perimeter times the tolerance; the 0.1% is nanosvg's own circle-by-cubics error.
+        assert(area_err <= perimeter * tol + area * 1.0e-3, "area within closed form")
+        assert(perim_err <= perimeter * 1.0e-3 + perimeter * tol / r, "perimeter within closed form")
+        // And smaller error as the tolerance tightens, until the cubic approximation's own floor.
+        if tol >= 0.25
+            assert(area_err < last_area_err, "area error must fall")
+            assert(perim_err < last_perim_err, "perimeter error must fall")
+        last_count = n
+        last_area_err = area_err
+        last_perim_err = perim_err
+    // The finest lands within a tenth of a percent of both.
+    assert(near_rel(last_perim_err + perimeter, perimeter, 2.0e-3))
+    assert(last_area_err < area * 2.0e-3)
+
+@test("every vertex of a flattened circle is on the circle, to nanosvg's own accuracy")
+circle_vertices_on_circle()
+    val o = first_outline(px100("<circle cx='50' cy='50' r='40'/>"), 0.5)
+    for p in o.points
+        val d = (p.x - 50.0).hypot(p.y - 50.0)
+        // A circle by four cubics strays from the true one by 0.03% of the radius.
+        assert(near(d, 40.0, 40.0 * 4.0e-4), "vertex off the circle")
+
+@test("the polyline stays within the tolerance of the curve, whatever the curve does")
+within_tolerance_of_the_curve()
+    // Sampled densely and measured against the polyline: no number here comes from the flattener.
+    val curves = ["M0 0 C 0 10, 10 10, 10 0",
+                  "M0 0 C 30 10, -20 10, 10 0",
+                  "M0 0 C 40 0, -30 0, 10 0",
+                  "M0 0 C 10 0, 10 0, 10 10",
+                  "M0 0 C 50 50, 50 -50, 0 0",
+                  "M0 0 C 30 0, 0 30, 30 30 S 60 0 30 0"]
+    for d in curves
+        val img = parse(doc("200", "200", "-100 -100 200 200", "<path fill='none' d='" + d + "'/>")).unwrap()
+        val path = img.shapes()[0].paths()[0]
+        for tol in [1.0, 0.1, 0.01]
+            val o = path.flatten(tol).unwrap()
+            assert(!o.closed)
+            var worst = 0.0
+            for seg in 0..<path.segments()
+                val c = path.bezier(seg)
+                // `a..b` is inclusive: 401 samples, t = 0 to 1.
+                for k in 0..400
+                    val t = f64(k) / 400.0
+                    val u = 1.0 - t
+                    val x = u * u * u * c.p0.x + 3.0 * u * u * t * c.p1.x + 3.0 * u * t * t * c.p2.x + t * t * t * c.p3.x
+                    val y = u * u * u * c.p0.y + 3.0 * u * u * t * c.p1.y + 3.0 * u * t * t * c.p2.y + t * t * t * c.p3.y
+                    worst = max(worst, distance_to_polyline(x, y, o))
+            assert(worst <= tol * 1.000001, "the curve strays from its polyline: " + d)
+
+// Distance from (x, y) to the nearest edge of the polyline.
+private distance_to_polyline(x: f64, y: f64, o: Outline) -> f64
+    var best = 1.0e300
+    val n = o.points.len()
+    for i in 0..<n
+        val a = o.points[i]
+        if i + 1 < n || o.closed
+            val b = o.points[(i + 1) % n]
+            best = min(best, distance_to_segment(x, y, a, b))
+        else if n == 1
+            best = min(best, (x - a.x).hypot(y - a.y))
+    best
+
+private distance_to_segment(x: f64, y: f64, a: Point, b: Point) -> f64
+    val dx = b.x - a.x
+    val dy = b.y - a.y
+    val len2 = dx * dx + dy * dy
+    var t = 0.0
+    if len2 > 0.0
+        t = ((x - a.x) * dx + (y - a.y) * dy) / len2
+    t = max(0.0, min(1.0, t))
+    (x - (a.x + t * dx)).hypot(y - (a.y + t * dy))
+
+@test("flattening is adaptive: a straight line stays one edge and a bend gets many")
+adaptive()
+    val straight = first_outline(px100("<path d='M0 0 L100 0'/>"), 0.001)
+    assert_eq(straight.points.len(), 2)
+    val curved = first_outline(px100("<path d='M0 50 C 0 0, 100 0, 100 50'/>"), 0.001)
+    assert(curved.points.len() > 20)
+    // Within one curve the points crowd where it bends: the first edge of a symmetric arch is
+    // not shorter than every other, but the edges are not all equal.
+    var shortest = 1.0e9
+    var longest = 0.0
+    for i in 0..<(curved.points.len() - 1)
+        val e = (curved.points[i + 1].x - curved.points[i].x).hypot(curved.points[i + 1].y - curved.points[i].y)
+        shortest = min(shortest, e)
+        longest = max(longest, e)
+    assert(longest > shortest * 1.2)
+
+@test("a tolerance finer than a float can resolve is raised, so the point count stays bounded")
+tolerance_floor()
+    val o = first_outline(px100("<circle cx='50' cy='50' r='40'/>"), 1.0e-300)
+    // Raised to about one float ulp of the coordinates, which is a few thousand points a circle,
+    // not the millions an unbounded 1e-300 would ask for.
+    assert(o.points.len() < 20000)
+    assert(o.points.len() > 1000)
+
+// -- The SVG 1.1 specification's own examples, worked by hand ------------------------------------------
+
+@test("spec paths.html triangle01: M 100 100 L 300 100 L 200 300 z in a 4cm box")
+spec_triangle01()
+    // <svg width="4cm" height="4cm" viewBox="0 0 400 400"> -- 400 user units across 4 cm, so a
+    // user unit is a tenth of a millimetre.
+    val svg = doc("4cm", "4cm", "0 0 400 400", "<path d='M 100 100 L 300 100 L 200 300 z' fill='red' stroke='blue' stroke-width='3'/>")
+    val img = parse(svg, Units.Cm, 96).unwrap()
+    assert(near(f64(img.width), 4.0, 1e-4))
+    assert(near(f64(img.height), 4.0, 1e-4))
+    val shape = img.shapes()[0]
+    assert_eq(shape.fill(), Paint.Solid(Color(255, 0, 0, 255)))
+    assert_eq(shape.stroke(), Paint.Solid(Color(0, 0, 255, 255)))
+    // The 3-unit stroke is 0.03 cm.
+    assert(near(f64(shape.stroke_width()), 0.03, 1e-5))
+    val o = shape.flatten(0.001).unwrap()[0]
+    assert(o.closed)
+    assert_eq(o.points.len(), 3)
+    // In centimetres the vertices are (1, 1), (3, 1), (2, 3).
+    assert(near(o.points[0].x, 1.0, 1e-4) && near(o.points[0].y, 1.0, 1e-4))
+    assert(near(o.points[1].x, 3.0, 1e-4) && near(o.points[1].y, 1.0, 1e-4))
+    assert(near(o.points[2].x, 2.0, 1e-4) && near(o.points[2].y, 3.0, 1e-4))
+    // Base 2, height 2 -> area 2 cm^2; sides 2, sqrt 5, sqrt 5.
+    assert(near(o.area().abs(), 2.0, 1e-4))
+    assert(near(o.perimeter(), 2.0 + 2.0 * 5.0.sqrt(), 1e-4))
+
+@test("spec paths.html quad01: Q and T become the cubics whose controls are two thirds along")
+spec_quad01()
+    // M200,300 Q400,50 600,300 T1000,300 on a 1200 x 600 canvas (the specification's box is 12cm x
+    // 6cm; read here in pixels so the numbers are the page's own).
+    val svg = doc("1200", "600", "0 0 1200 600", "<path d='M200,300 Q400,50 600,300 T1000,300' fill='none' stroke='red' stroke-width='5'/>")
+    val img = parse(svg).unwrap()
+    val p = img.shapes()[0].paths()[0]
+    assert_eq(p.segments(), 2)
+    // The quadratic's control q becomes cubic controls p0 + 2/3 (q - p0) and p2 + 2/3 (q - p2).
+    val s0 = p.bezier(0)
+    assert(near(s0.p0.x, 200.0, 1e-3) && near(s0.p0.y, 300.0, 1e-3))
+    assert(near(s0.p1.x, 200.0 + 400.0 / 3.0, 1e-2) && near(s0.p1.y, 300.0 - 500.0 / 3.0, 1e-2))
+    assert(near(s0.p2.x, 600.0 - 400.0 / 3.0, 1e-2) && near(s0.p2.y, 300.0 - 500.0 / 3.0, 1e-2))
+    assert(near(s0.p3.x, 600.0, 1e-3) && near(s0.p3.y, 300.0, 1e-3))
+    // T reflects the control about the join: (400, 50) -> (800, 550).
+    val s1 = p.bezier(1)
+    assert(near(s1.p0.x, 600.0, 1e-3))
+    assert(near(s1.p1.x, 600.0 + 400.0 / 3.0, 1e-2) && near(s1.p1.y, 300.0 + 500.0 / 3.0, 1e-2))
+    assert(near(s1.p2.x, 1000.0 - 400.0 / 3.0, 1e-2) && near(s1.p2.y, 300.0 + 500.0 / 3.0, 1e-2))
+    assert(near(s1.p3.x, 1000.0, 1e-3) && near(s1.p3.y, 300.0, 1e-3))
+
+@test("the area under a quadratic is two thirds of base times height")
+spec_quad_area()
+    // Archimedes: the arch from (200,300) over control (400,50) to (600,300) has height 125 at its
+    // middle, so it encloses 2/3 * 400 * 125 with its chord. A quadratic is a cubic exactly, so
+    // nanosvg's conversion loses nothing.
+    val svg = doc("1200", "600", "0 0 1200 600", "<path d='M200,300 Q400,50 600,300 Z'/>")
+    for tol in [1.0, 0.1, 0.01]
+        val o = first_outline(svg, tol)
+        assert(o.closed)
+        val got = o.area().abs()
+        val want = 2.0 / 3.0 * 400.0 * 125.0
+        // An inscribed polygon cannot exceed the arch, and misses at most arc length times tolerance.
+        assert(got <= want + 1e-6, "an inscribed polygon cannot exceed the arch")
+        assert(got >= want - 450.0 * tol, "area short of 2/3 * base * height")
+
+@test("spec paths.html arcs01: M300,200 h-150 a150,150 0 1,0 150,-150 z is three quarters of a disc")
+spec_arcs01()
+    // The relative h, then an arc of radius 150, large-arc flag 1, sweep flag 0, from (150, 200) to
+    // (300, 50), then z: a pie of radius 150 centred at (300, 200) with a quarter missing.
+    val svg = doc("1200", "525", "0 0 1200 525", "<path d='M300,200 h-150 a150,150 0 1,0 150,-150 z' fill='red' stroke='blue' stroke-width='5'/>")
+    val pi = 3.141592653589793
+    val area = 0.75 * pi * 150.0 * 150.0
+    val perimeter = 150.0 + 150.0 + 0.75 * 2.0 * pi * 150.0
+    val o = first_outline(svg, 0.01)
+    assert(o.closed)
+    assert(near_rel(o.area().abs(), area, 1.5e-3), "three quarters of a disc")
+    assert(near_rel(o.perimeter(), perimeter, 1.5e-3), "two radii and three quarters of a circle")
+    // The first edge is the horizontal run to the centre of the disc, 150 long.
+    assert(near(o.points[0].x, 300.0, 1e-4) && near(o.points[0].y, 200.0, 1e-4))
+    assert(near(o.points[1].x, 150.0, 1e-4) && near(o.points[1].y, 200.0, 1e-4))
+
+@test("the same arc with the sweep flag the other way takes the other centre")
+spec_arcs_sweep()
+    val svg = doc("1200", "525", "0 0 1200 525", "<path d='M300,200 h-150 a150,150 0 1,1 150,-150 z'/>")
+    val o = first_outline(svg, 0.01)
+    val pi = 3.141592653589793
+    // Sweep 1 puts the centre at (150, 50). The arc from (150, 200) to (300, 50) is then the large
+    // one, 270 degrees: a segment of (r^2 / 2)(3 pi / 2 + 1), and z closes it to (300, 200), which
+    // lies on the far side of the chord, adding that right triangle of r^2 / 2.
+    val r2 = 150.0 * 150.0
+    val want = r2 / 2.0 * (1.5 * pi + 1.0) + r2 / 2.0
+    assert(near_rel(o.area().abs(), want, 1.5e-3), "large arc, other sweep")
+
+// -- Lifetime ----------------------------------------------------------------------------------------
+
+@test("parsing and dropping many images works, each handle freeing its tree")
+many_images()
+    for i in 0..<500
+        val img = parse(px100("<circle cx='50' cy='50' r='40'/><rect width='5' height='5'/>")).unwrap()
+        assert_eq(img.shapes().len(), 2)
+
+@test("two images are independent")
+two_images()
+    val a = parse(px100("<rect id='a' width='10' height='10'/>")).unwrap()
+    val b = parse(px100("<rect id='b' width='20' height='20'/><rect id='c' width='5' height='5'/>")).unwrap()
+    assert_eq(a.shapes().len(), 1)
+    assert_eq(b.shapes().len(), 2)
+    assert_eq(a.shapes()[0].id(), "a")
+    assert_eq(b.shapes()[1].id(), "c")
+
+// The README's example, verbatim.
+private outline_points(text: string) -> Result[usize, Error]
+    val img = parse(text, Units.Mm)?
+    var total = 0
+    for shape in img.shapes()
+        if shape.visible()
+            for outline in shape.flatten(0.01)?
+                total += outline.points.len()
+    Ok(total)
+
+@test("the README example runs: a square is four points, and a hidden shape counts for none")
+readme_example()
+    assert_eq(outline_points("<svg width='10mm' height='10mm'><rect width='10' height='10'/></svg>"), Ok(4))
+    assert_eq(outline_points("<svg><rect display='none' width='10' height='10'/></svg>"), Ok(0))
+    assert_eq(outline_points("nope"), Err(Error.NotSvg))
+
+@test("dpi must be positive")
+bad_dpi()
+    assert_eq(parse("<svg/>", Units.Mm, 0.0).err(), Some(Error.BadDpi))
+    assert_eq(parse("<svg/>", Units.Mm, -96.0).err(), Some(Error.BadDpi))
+    assert_eq(parse("<svg/>", Units.Mm, 0.0 / 0.0).err(), Some(Error.BadDpi))
+
+// -- Fuzzing the parser through the binding ----------------------------------------------------------
+//
+// A bounded, deterministic run: a fixed generator mutates a corpus of valid documents -- flipping,
+// deleting, inserting and duplicating bytes, splicing in tokens that parsers dislike, truncating --
+// and every result that parses is walked completely and flattened. It finds nothing on its own; run
+// under AddressSanitizer (`SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .`) it is the check
+// that vendored nanosvg reads and writes inside its buffers. `FUZZ_ITERATIONS` is the knob.
+
+private val FUZZ_ITERATIONS = 3000
+
+// xorshift64: a generator with no multiplication, so nothing in it can overflow.
+struct Rng
+    state: u64
+
+    next(*self) -> u64
+        var x = self.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        self.state = x
+        x
+
+    below(*self, n: usize) -> usize = usize(self.next() % u64(n))
+end Rng
+
+private corpus() -> []string = [
+    "<svg width='100' height='100' viewBox='0 0 100 100'><rect x='10' y='10' width='30' height='20' rx='4' fill='#ff0000' stroke='blue'/></svg>",
+    "<svg width='50mm' height='50mm' viewBox='0 0 50 50'><circle id='c' cx='25' cy='25' r='20'/><ellipse cx='5' cy='5' rx='3' ry='2'/></svg>",
+    "<svg viewBox='0 0 100 100'><path d='M10 10 L90 10 L90 90 Z M30 30 H70 V70 H30 Z' fill-rule='evenodd'/></svg>",
+    "<svg width='100' height='100'><path d='M20 50 a30 30 0 1 0 60 0 a30 30 0 1 0 -60 0 q10 20 30 0 t20 0 s5 5 10 10 c1 2 3 4 5 6 z'/></svg>",
+    "<svg width='100' height='100'><g transform='translate(10 10) rotate(30) scale(2) skewX(5)'><g id='in' style='fill:#0f0;stroke:#00f;stroke-width:2;opacity:.5;display:inline'><polyline points='0,0 10,5 20,0'/><polygon points='0,0 5,5 10,0'/><line x1='0' y1='0' x2='9' y2='9'/></g></g></svg>",
+    "<svg width='100' height='100'><defs><linearGradient id='g' x1='0' x2='1'><stop offset='0' stop-color='red'/><stop offset='1' stop-color='blue'/></linearGradient><radialGradient id='h' xlink:href='#g'/></defs><rect width='10' height='10' fill='url(#g)'/><rect width='5' height='5' fill='url(#h)' stroke-dasharray='1 2 3' stroke-linejoin='bevel'/></svg>",
+    "<svg width='100' height='100'><style>.a{fill:#123456;stroke-width:3}</style><rect class='a' width='9' height='9'/><!-- note --><![CDATA[ x ]]><text>hello</text></svg>"
+]
+
+private tokens() -> []string = [
+    "<g>", "</g>", "<svg", "</svg>", "<path d='", "'", "\"", "=", "<", ">", "/", " ", "-", ".", "+",
+    "e", "E", "e99", "e-99", "1e999", "-1e999", "99999999999999999999", "0.000000000000000000001",
+    "nan", "inf", "M", "m", "L", "Z", "z", "A", "a", "C", "S", "Q", "T", "H", "V", "0 0 0 0 0 0 0",
+    "transform='matrix(1e30 0 0 1e30 0 0)'", "translate(", "scale(0)", "rotate(", ")", "url(#", "#g",
+    "style='", ";", ":", "xlink:href='#", "viewBox='0 0 0 0'", "viewBox='-1e30 -1e30 1e30 1e30'",
+    "width='0'", "width='-5'", "stroke-dasharray='", ",", "rgb(", "%", "mm", "in", "<!--", "-->",
+    "<![CDATA[", "]]>", "&amp;", "&#x41;", "\u{0}"
+]
+
+// Mutates `b` in place by one randomly chosen operation.
+private mutate(b: Buf[u8], rng: *Rng)
+    val n = b.len()
+    if n == 0
+        b.push(u8(rng.next() % 256))
+        return
+    val op = rng.below(8)
+    val at = rng.below(n)
+    if op == 0
+        b[at] = u8(rng.next() % 256)
+    else if op == 1
+        b[at] = b[rng.below(n)]
+    else if op == 2
+        for i in 0..<rng.below(8)
+            if at < b.len() then b.remove(at)
+    else if op == 3
+        b.insert(at, u8(rng.next() % 256))
+    else if op == 4 || op == 5
+        val t = tokens()[rng.below(tokens().len)]
+        var k = at
+        for ch in t.bytes
+            b.insert(k, ch)
+            k += 1
+    else if op == 6
+        // Duplicate a chunk elsewhere.
+        val len = min(rng.below(40) + 1, n - at)
+        var chunk: Buf[u8] = buf()
+        for i in 0..<len
+            chunk.push(b[at + i])
+        var k = rng.below(n)
+        for ch in chunk.view()
+            b.insert(k, ch)
+            k += 1
+    else
+        b.truncate(at)
+
+// Everything a caller can ask of a parsed image.
+private walk(img: &Image) -> usize
+    var points = 0
+    for s in img.shapes()
+        s.id()
+        s.visible()
+        s.opacity()
+        s.fill()
+        s.stroke()
+        s.fill_rule()
+        s.stroke_width()
+        s.line_join()
+        s.line_cap()
+        s.miter_limit()
+        s.dashes()
+        s.dash_offset()
+        s.bounds()
+        for p in s.paths()
+            p.closed()
+            p.bounds()
+            val pts = p.points()
+            points += pts.len
+            for i in 0..<p.segments()
+                p.bezier(i)
+        for tol in [8.0, 0.05]
+            for o in s.flatten(tol).unwrap()
+                o.area()
+                o.perimeter()
+                points += o.points.len()
+    points
+
+private run_fuzz(iterations: int, seed: u64) -> (int, int)
+    var rng = Rng(seed)
+    var parsed = 0
+    var walked = 0
+    for it in 0..<iterations
+        var b: Buf[u8] = buf()
+        b.extend(corpus()[rng.below(corpus().len)].bytes)
+        for m in 0..<(rng.below(4) + 1)
+            mutate(b, &rng)
+        parse_bytes(b.view()) match
+            Ok(img) ->
+                parsed += 1
+                walked += int(walk(img) % 1000)
+            Err(_)  -> ()
+    (parsed, walked)
+
+@test("fuzz: mutated documents parse and walk without a fault")
+fuzz_mutated_documents()
+    val r = run_fuzz(FUZZ_ITERATIONS, 0x9E3779B97F4A7C15)
+    // Most mutants must still be SVGs, or the run is not reaching the parser.
+    assert(r.0 > FUZZ_ITERATIONS / 2, "the corpus must survive mutation often enough to exercise the parser")
+    assert(r.1 > 0)
+
+@test("an arc through an infinite coordinate parses, though UBSan flags upstream's cast")
+arc_through_infinity()
+    // FINDING in vendored nanosvg (not patched): `(int)(fabsf(da) / ...)` at nanosvg.h:2311 converts
+    // a NaN to int when an arc has a non-finite endpoint, which is undefined behaviour in C. It is
+    // harmless where the conversion saturates (arm64 gives 0) and nothing reads out of bounds, so
+    // AddressSanitizer is clean; `-fsanitize=undefined` reports it. This test is here so the input
+    // is kept, and a run with UBSan will stop on it.
+    for d in ["M1e999 0 A 5 5 0 0 0 5 5", "M0 0 A 1e999 1e999 0 0 0 5 5", "M0 0 A 5 5 0 0 0 1e999 1e999"]
+        val img = parse("<svg><path d='" + d + "'/></svg>").unwrap()
+        for s in img.shapes()
+            for o in s.flatten(1.0).unwrap()
+                assert(o.points.len() < 100000)
+
+@test("fuzz: the unmutated corpus parses and walks")
+fuzz_corpus_clean()
+    for d in corpus()
+        val img = parse(d).unwrap()
+        assert(walk(img) > 0)

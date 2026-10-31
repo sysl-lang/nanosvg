@@ -1,0 +1,113 @@
+module sh.sysl.nanosvg.c
+
+// nanosvg as C reaches it: the vendored header, the `shim.c` that compiles it, and one `extern` per
+// read the layer above makes.
+//
+// **Everything that is C lives in this directory** -- `nanosvg.h` as it comes from upstream, the
+// `shim.c` that holds its body and answers for the structs, the `shim.h` that says what those
+// answers are, and this file of declarations over them. Nothing here is meant to be called by a
+// program: a parse hands back a raw pointer nobody owns, a shape is another, and a status is a
+// bare `int`. `sh.sysl.nanosvg` is what an application imports.
+//
+// The split keeps two jobs apart. This one has to be **faithful** -- a signature that disagrees
+// with the C links perfectly and corrupts the call at run time, and nothing checks one against the
+// other, so each declaration below was read out of `shim.c` rather than remembered. The other one
+// has to be **pleasant**.
+//
+// **Only two functions are nanosvg's own**: `nsvgDelete`, which is the whole of ownership -- the
+// image is one `malloc`ed tree and that call frees all of it -- and nothing else. The parse is the
+// shim's, so that the unit crosses as a number rather than a C string sysl would have to keep alive,
+// and every read of a struct is an accessor, which the C compiler checks against the real layout.
+
+@link("m")
+@include("nanosvg.h")
+@include("shim.h")
+
+// The three things a parse hands out, named and never laid out. A `Shape` and a `Path` are
+// interior pointers into the `Image`'s one allocation and die with it.
+opaque struct Image
+opaque struct Shape
+opaque struct Path
+
+// ## The numbers, asked for rather than written down
+
+// What the shim accepts as a unit.
+c const
+    UNITS_PX: int = "SYSL_NSVG_UNITS_PX"
+    UNITS_PT: int = "SYSL_NSVG_UNITS_PT"
+    UNITS_PC: int = "SYSL_NSVG_UNITS_PC"
+    UNITS_MM: int = "SYSL_NSVG_UNITS_MM"
+    UNITS_CM: int = "SYSL_NSVG_UNITS_CM"
+    UNITS_IN: int = "SYSL_NSVG_UNITS_IN"
+
+// What a paint can be. A gradient is reported as such and nothing more is read of it.
+c const
+    PAINT_UNDEF: int           = "NSVG_PAINT_UNDEF"
+    PAINT_NONE: int            = "NSVG_PAINT_NONE"
+    PAINT_COLOR: int           = "NSVG_PAINT_COLOR"
+    PAINT_LINEAR_GRADIENT: int = "NSVG_PAINT_LINEAR_GRADIENT"
+    PAINT_RADIAL_GRADIENT: int = "NSVG_PAINT_RADIAL_GRADIENT"
+
+c const
+    JOIN_MITER: int = "NSVG_JOIN_MITER"
+    JOIN_ROUND: int = "NSVG_JOIN_ROUND"
+    JOIN_BEVEL: int = "NSVG_JOIN_BEVEL"
+
+c const
+    CAP_BUTT: int   = "NSVG_CAP_BUTT"
+    CAP_ROUND: int  = "NSVG_CAP_ROUND"
+    CAP_SQUARE: int = "NSVG_CAP_SQUARE"
+
+c const
+    FILLRULE_NONZERO: int = "NSVG_FILLRULE_NONZERO"
+    FILLRULE_EVENODD: int = "NSVG_FILLRULE_EVENODD"
+
+// ## The image
+
+// `input` is NUL-terminated and is EDITED IN PLACE; the caller owns it. Null only when nanosvg could
+// not allocate.
+extern "sysl_nsvg_parse" parse(input: *u8, units: int, dpi: f32) -> *Image
+
+// Frees the image and every shape and path in it.
+extern "nsvgDelete" delete(image: *Image) -> unit
+
+extern "sysl_nsvg_image_width" image_width(image: *Image) -> f32
+extern "sysl_nsvg_image_height" image_height(image: *Image) -> f32
+extern "sysl_nsvg_image_shapes" image_shapes(image: *Image) -> *Shape
+
+// ## A shape
+
+extern "sysl_nsvg_shape_next" shape_next(shape: *Shape) -> *Shape
+extern "sysl_nsvg_shape_paths" shape_paths(shape: *Shape) -> *Path
+
+// A NUL-terminated string inside the shape, at most 63 bytes.
+extern "sysl_nsvg_shape_id" shape_id(shape: *Shape) -> *u8
+
+extern "sysl_nsvg_shape_fill_type" shape_fill_type(shape: *Shape) -> int
+extern "sysl_nsvg_shape_fill_color" shape_fill_color(shape: *Shape) -> u32
+extern "sysl_nsvg_shape_stroke_type" shape_stroke_type(shape: *Shape) -> int
+extern "sysl_nsvg_shape_stroke_color" shape_stroke_color(shape: *Shape) -> u32
+
+extern "sysl_nsvg_shape_opacity" shape_opacity(shape: *Shape) -> f32
+extern "sysl_nsvg_shape_stroke_width" shape_stroke_width(shape: *Shape) -> f32
+extern "sysl_nsvg_shape_line_join" shape_line_join(shape: *Shape) -> int
+extern "sysl_nsvg_shape_line_cap" shape_line_cap(shape: *Shape) -> int
+extern "sysl_nsvg_shape_miter_limit" shape_miter_limit(shape: *Shape) -> f32
+extern "sysl_nsvg_shape_fill_rule" shape_fill_rule(shape: *Shape) -> int
+extern "sysl_nsvg_shape_visible" shape_visible(shape: *Shape) -> int
+extern "sysl_nsvg_shape_dash_count" shape_dash_count(shape: *Shape) -> int
+extern "sysl_nsvg_shape_dash_offset" shape_dash_offset(shape: *Shape) -> f32
+extern "sysl_nsvg_shape_dash" shape_dash(shape: *Shape, i: int) -> f32
+
+// Writes four floats: minx, miny, maxx, maxy.
+extern "sysl_nsvg_shape_bounds" shape_bounds(shape: *Shape, out: *f32) -> unit
+
+// ## A path
+
+extern "sysl_nsvg_path_next" path_next(path: *Path) -> *Path
+
+// `2 * npts` floats: x0,y0, then for each segment cx1,cy1, cx2,cy2, x1,y1.
+extern "sysl_nsvg_path_pts" path_pts(path: *Path) -> *f32
+extern "sysl_nsvg_path_npts" path_npts(path: *Path) -> int
+extern "sysl_nsvg_path_closed" path_closed(path: *Path) -> int
+extern "sysl_nsvg_path_bounds" path_bounds(path: *Path, out: *f32) -> unit

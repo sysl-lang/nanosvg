@@ -1,0 +1,34 @@
+// SVG parsing into cubic bezier outlines, bound to nanosvg.
+//
+// nanosvg depends on `<string.h>`, `<stdlib.h>`, `<stdio.h>` and `<math.h>` and nothing else, and
+// it is not a library anybody has installed, so its header is carried in this package. There is no
+// `dependencies` block.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       nanosvg { git = "github.com/sysl-lang/nanosvg", version = "0.1.0" }
+//     }
+//
+// The module a program imports is `sh.sysl.nanosvg`; the package name is the short one.
+
+package {
+  name    = "nanosvg"
+  version = "0.1.0"
+  sysl    = "0.8.6"
+}
+
+// **`heap` and nothing else.** nanosvg `malloc`s an image as a tree of small blocks and
+// `nsvgDelete` frees it, so a parse needs an allocator. It reads no file of ours: `nsvgParseFromFile`
+// is compiled in (nanosvg has no switch for it) but nothing here calls it, and `sysl.fs` hands the
+// bytes over instead -- the same reason `stb` states no `posix`.
+//
+// **Not buildable on a bare board.** nanosvg includes `<string.h>`, `<stdlib.h>` and `<stdio.h>`
+// unconditionally, which a freestanding clang does not ship; it compiles with a libc (newlib).
+// README has the two commands and their answers.
+requires {
+  heap = true
+}
+
+// **`m` is linked**: the parser reaches `sqrtf`, `cosf`, `tanf` and `fabsf` for arcs, rotations and
+// bounds.

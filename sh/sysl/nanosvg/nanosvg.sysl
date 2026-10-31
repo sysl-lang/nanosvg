@@ -1,0 +1,457 @@
+module sh.sysl.nanosvg
+
+import sh.sysl.nanosvg.c
+import sysl.buf.{Buf, buf}
+import sysl.math.max
+import sysl.slices.as_mut_ptr
+import sysl.text.from_cstring
+
+// SVG outlines as cubic beziers, bound to `nanosvg.h` sitting beside this file.
+//
+// nanosvg parses the shapes of an SVG into lists of cubic bezier paths: every line, arc, quadratic
+// and primitive (`rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`) arrives as cubics, with
+// the `transform`, the `viewBox` and the unit already applied. That is exactly what a modeller wants
+// from an SVG it will extrude, and what it does not want is anything to do with drawing: the
+// rasteriser, `nanosvgrast.h`, is deliberately not bound (see `SURVEY.md`).
+//
+// ==Three verbs==
+//
+//     val img = parse(text, Units.Mm)?                  // an image: a handle that frees itself
+//     for shape in img.shapes()                         // shapes, in document order
+//         val outlines = shape.flatten(0.01)?           // polylines, in the image's units
+//
+// **An `Image` is a `&` handle with a `Drop`**, because the storage is C's: nanosvg `malloc`s the
+// image as one tree of small blocks and `nsvgDelete` frees the lot. Its constructor answers `&Image`,
+// which is not a style choice -- a destructor fires when a *box's* count reaches zero, so a
+// constructor answering a plain `Image` would leak every parse while passing every test.
+//
+// **A `Shape` and a `Path` are views into that tree and live exactly as long as the `Image` does.**
+// Keeping one past the image reads freed memory; copy what is needed (`flatten` returns plain
+// values) first.
+//
+// ==The input is copied, because nanosvg edits it==
+//
+// `nsvgParse` takes a NUL-terminated buffer and rewrites it as it tokenises. A sysl `string` is
+// neither mutable nor NUL-terminated (only a literal is followed by a zero), so `parse` copies the
+// bytes into storage of its own, terminates it, and keeps it alive across the call.
+//
+// ==Units==
+//
+// `Units` and `dpi` choose what a coordinate means in the answer. Absolute lengths in the file
+// (`10mm`, `1in`) come out right whatever the dpi, because the same dpi converts them to pixels and
+// back. **Unitless numbers are CSS pixels**, as SVG defines them, so they are scaled by
+// `unit / dpi` -- 100 unitless user units are 26.46 mm at 96 dpi but exactly 100 mm at 25.4 dpi.
+// Pass `25.4` with `Units.Mm` when a file's bare numbers are already millimetres.
+
+// Why a parse or a flatten did not happen.
+enum Error
+    // There is no `<svg` anywhere in the input. nanosvg answers an empty image for any text at all,
+    // so this is the only way a caller learns it was not given an SVG. It is a necessary check, not
+    // a sufficient one: a file that opens an `<svg` and is then cut off still parses, to whatever
+    // was complete.
+    NotSvg
+
+    // nanosvg could not allocate.
+    NoMemory
+
+    // The tolerance is not a positive number (zero, negative or NaN).
+    BadTolerance
+
+    // The dpi is not a positive number. nanosvg divides by it.
+    BadDpi
+
+    // What went wrong, as a sentence.
+    message(self) -> string = self match
+        NotSvg       -> "the input contains no <svg element"
+        NoMemory     -> "out of memory"
+        BadTolerance -> "the flattening tolerance must be a positive number"
+        BadDpi       -> "the dpi must be a positive number"
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// The unit a parse reports coordinates in.
+enum Units
+    Px
+    Pt
+    Pc
+    Mm
+    Cm
+    In
+
+    code(self) -> int = self match
+        Px -> c.UNITS_PX
+        Pt -> c.UNITS_PT
+        Pc -> c.UNITS_PC
+        Mm -> c.UNITS_MM
+        Cm -> c.UNITS_CM
+        In -> c.UNITS_IN
+
+    // How many CSS pixels one of this unit is, at `dpi` dots per inch. nanosvg's own table:
+    // 72 pt, 6 pc, 25.4 mm, 2.54 cm to the inch.
+    pixels(self, dpi: f32) -> f64 = self match
+        Px -> 1.0
+        Pt -> f64(dpi) / 72.0
+        Pc -> f64(dpi) / 6.0
+        Mm -> f64(dpi) / 25.4
+        Cm -> f64(dpi) / 2.54
+        In -> f64(dpi)
+end Units
+
+// A point in the image's units. `f64`, though nanosvg stores `f32`: flattening computes new points
+// between its own, and nothing is gained by rounding those back down.
+struct Point derives Eq
+    x: f64
+    y: f64
+
+// One cubic bezier segment: start, two control points, end.
+struct Cubic derives Eq
+    p0: Point
+    p1: Point
+    p2: Point
+    p3: Point
+
+// An axis-aligned box, as nanosvg's tight bounds.
+struct Bounds derives Eq
+    min_x: f32
+    min_y: f32
+    max_x: f32
+    max_y: f32
+
+// A colour with alpha, 0 to 255 a channel.
+struct Color derives Eq
+    r: u8
+    g: u8
+    b: u8
+    a: u8
+
+// nanosvg packs a colour as `r | g << 8 | b << 16 | a << 24`.
+private unpack(v: u32) -> Color =
+    Color(u8(v & 255), u8((v >> 8) & 255), u8((v >> 16) & 255), u8((v >> 24) & 255))
+
+// What a shape is filled or stroked with. A gradient is reported and nothing more is read of it.
+enum Paint derives Eq
+    None
+    Solid(color: Color)
+    LinearGradient
+    RadialGradient
+end Paint
+
+enum FillRule
+    NonZero
+    EvenOdd
+
+enum LineJoin
+    Miter
+    Round
+    Bevel
+
+enum LineCap
+    Butt
+    Round
+    Square
+
+// A parsed SVG, owned by nanosvg until this handle goes.
+struct Image
+    private p: *c.Image
+
+    // The size of the image in the units it was parsed in.
+    //
+    // **This is converted here, because nanosvg does not**: it scales every shape into the unit
+    // asked for but leaves the image's own `width` and `height` in CSS pixels at the dpi (a
+    // `10mm` image parsed as `Mm` reports 37.8). The conversion is the inverse of the one it
+    // applies to the paths, so the size and the shapes agree.
+    width: f32
+    height: f32
+
+    // What the parse was asked for, so a consumer holding only the image knows what its numbers mean.
+    units: Units
+    dpi: f32
+
+    // The shapes in document order. Each is a view into this image.
+    shapes(&self) -> Buf[Shape]
+        var out: Buf[Shape] = buf()
+        var s = c.image_shapes(self.p)
+        while usize(s) != 0
+            out.push(Shape(self, s))
+            s = c.shape_next(s)
+        out
+end Image
+
+impl Drop for Image
+    drop(self)
+        c.delete(self.p)
+    end drop
+
+// One element of the document -- a `path`, a `rect`, a `circle` -- with the paint and stroke it
+// was given and the paths it drew. A `<path>` with several subpaths is one shape with several
+// `Path`s.
+struct Shape
+    // Keeps the image alive: a shape is a view into its tree, so while one exists the tree is not freed.
+    private owner: &Image
+    private p: *c.Shape
+
+    // The element's `id`, or its enclosing group's when it has none; empty if neither does. At most
+    // 63 bytes. Bytes that are not valid UTF-8 give an empty string.
+    id(self) -> string = from_cstring(c.shape_id(self.p)) match
+        Ok(s)  -> s.copy()
+        Err(_) -> ""
+
+    // `false` for `display:none`, `visibility:hidden` and the like. nanosvg keeps invisible shapes
+    // in the list and flags them, so a caller that wants only what shows has to ask.
+    visible(self) -> bool = c.shape_visible(self.p) != 0
+
+    // The shape's own opacity, 0 to 1.
+    opacity(self) -> f32 = c.shape_opacity(self.p)
+
+    fill(self) -> Paint = paint(c.shape_fill_type(self.p), c.shape_fill_color(self.p))
+
+    stroke(self) -> Paint = paint(c.shape_stroke_type(self.p), c.shape_stroke_color(self.p))
+
+    // How a self-crossing or nested set of paths decides what is inside. A hole is a second path
+    // wound inside the first under `EvenOdd`, and under `NonZero` only when it is wound the other way.
+    fill_rule(self) -> FillRule = c.shape_fill_rule(self.p) match
+        c.FILLRULE_EVENODD -> EvenOdd
+        _                  -> NonZero
+
+    // The stroke width in the image's units.
+    stroke_width(self) -> f32 = c.shape_stroke_width(self.p)
+
+    line_join(self) -> LineJoin = c.shape_line_join(self.p) match
+        c.JOIN_ROUND -> LineJoin.Round
+        c.JOIN_BEVEL -> Bevel
+        _            -> Miter
+
+    line_cap(self) -> LineCap = c.shape_line_cap(self.p) match
+        c.CAP_ROUND  -> LineCap.Round
+        c.CAP_SQUARE -> Square
+        _            -> Butt
+
+    miter_limit(self) -> f32 = c.shape_miter_limit(self.p)
+
+    // The stroke's dash lengths, scaled to the image's units; empty for a solid line.
+    dashes(self) -> Buf[f32]
+        var out: Buf[f32] = buf()
+        for i in 0..<c.shape_dash_count(self.p)
+            out.push(c.shape_dash(self.p, i))
+        out
+
+    dash_offset(self) -> f32 = c.shape_dash_offset(self.p)
+
+    // The tight bounding box of every path in the shape.
+    bounds(self) -> Bounds
+        var b: [4]f32
+        c.shape_bounds(self.p, &b[0])
+        Bounds(b[0], b[1], b[2], b[3])
+
+    // The paths in this shape.
+    paths(self) -> Buf[Path]
+        var out: Buf[Path] = buf()
+        var q = c.shape_paths(self.p)
+        while usize(q) != 0
+            out.push(Path(self.owner, q))
+            q = c.path_next(q)
+        out
+
+    // Every path flattened to a polyline within `tolerance` of the true curve; see `Path.flatten`.
+    flatten(self, tolerance: f64) -> Result[Buf[Outline], Error]
+        var out: Buf[Outline] = buf()
+        for p in self.paths()
+            out.push(p.flatten(tolerance)?)
+        Ok(out)
+end Shape
+
+private paint(kind: int, color: u32) -> Paint = kind match
+    c.PAINT_COLOR           -> Solid(unpack(color))
+    c.PAINT_LINEAR_GRADIENT -> LinearGradient
+    c.PAINT_RADIAL_GRADIENT -> RadialGradient
+    _                       -> None
+
+// One subpath: a run of cubic beziers, `1 + 3n` points in all.
+struct Path
+    private owner: &Image
+    private p: *c.Path
+
+    // `true` when the path ended with `Z` or is a closed primitive. nanosvg then repeats the start
+    // point as the last point.
+    closed(self) -> bool = c.path_closed(self.p) != 0
+
+    // How many points there are: one start, then three per segment.
+    count(self) -> usize = usize(c.path_npts(self.p))
+
+    // How many cubic segments there are.
+    segments(self) -> usize = if self.count() == 0 then 0 else (self.count() - 1) / 3
+
+    // The points as nanosvg stores them, `x0, y0, cx1, cy1, cx2, cy2, x1, y1, ...`: two floats a
+    // point. A view into the image.
+    points(self) -> []const f32
+        val q = c.path_pts(self.p)
+        q[0..<(2 * self.count())]
+
+    // The `i`th point.
+    point(self, i: usize) -> Point
+        val q = self.points()
+        Point(f64(q[2 * i]), f64(q[2 * i + 1]))
+
+    // The `i`th cubic segment.
+    bezier(self, i: usize) -> Cubic =
+        Cubic(self.point(3 * i), self.point(3 * i + 1), self.point(3 * i + 2), self.point(3 * i + 3))
+
+    bounds(self) -> Bounds
+        var b: [4]f32
+        c.path_bounds(self.p, &b[0])
+        Bounds(b[0], b[1], b[2], b[3])
+
+    // This path as a polyline, every vertex within `tolerance` of the true curve, in the image's
+    // units. See `flatten_path`.
+    flatten(self, tolerance: f64) -> Result[Outline, Error] = flatten_path(self, tolerance)
+end Path
+
+// A flattened path: its vertices in order, and whether the last joins back to the first.
+//
+// **A closed outline does not repeat its first vertex at the end**, and has no two equal vertices
+// in a row; the closing edge is implied by `closed`.
+struct Outline
+    points: Buf[Point]
+    closed: bool
+
+    // The signed area by the shoelace formula: positive when the vertices run anticlockwise with
+    // y pointing up. **An open outline is closed by its chord first**, as SVG fills it.
+    area(self) -> f64
+        var sum = 0.0
+        val n = self.points.len()
+        for i in 0..<n
+            val a = self.points[i]
+            val b = self.points[(i + 1) % n]
+            sum += a.x * b.y - b.x * a.y
+        sum / 2.0
+
+    // The length of the polyline; for a closed outline that includes the closing edge.
+    perimeter(self) -> f64
+        var sum = 0.0
+        val n = self.points.len()
+        for i in 0..<n
+            if i + 1 < n || self.closed
+                val a = self.points[i]
+                val b = self.points[(i + 1) % n]
+                sum += (b.x - a.x).hypot(b.y - a.y)
+        sum
+end Outline
+
+// ## Parsing
+
+private has_svg(data: []const u8) -> bool
+    // `<svg`, byte by byte: 60 115 118 103.
+    if data.len < 4 then return false
+    for i in 0..<(data.len - 3)
+        if data[i] == u8('<') && data[i + 1] == u8('s') && data[i + 2] == u8('v') && data[i + 3] == u8('g')
+            return true
+    false
+
+// Parses SVG text into an image with coordinates in `units`, converting at `dpi` dots per inch.
+//
+//     val img = parse("<svg width=\"10mm\" height=\"10mm\"><rect width=\"10\" height=\"10\"/></svg>", Units.Mm)?
+//
+// If you do not know or care about the unit, `Units.Px` at 96 is the default.
+parse(svg: string, units: Units = Units.Px, dpi: f32 = 96) -> Result[&Image, Error] =
+    parse_bytes(svg.bytes, units, dpi)
+
+// The same from bytes, as read from a file. A NUL byte ends the document, as it does in nanosvg.
+parse_bytes(data: []const u8, units: Units = Units.Px, dpi: f32 = 96) -> Result[&Image, Error]
+    if !(dpi > 0.0) then return Err(BadDpi)
+    if !has_svg(data) then return Err(NotSvg)
+
+    // nanosvg edits its input and needs a terminator; this copy is both, and `text` is held in a
+    // local across the call.
+    var text: Buf[u8] = buf()
+    text.extend(data)
+    text.push(0)
+
+    val q = c.parse(as_mut_ptr(text.view()), units.code(), dpi)
+    if usize(q) == 0 then return Err(NoMemory)
+
+    val per = units.pixels(dpi)
+    Ok(Image(q, f32(f64(c.image_width(q)) / per), f32(f64(c.image_height(q)) / per), units, dpi))
+
+// ## Flattening
+
+// Where a cubic's control point `q` sits relative to the chord `a`-`d`, as the distance the curve
+// could stray toward it. Inside the chord's slab that is three quarters of the perpendicular
+// distance -- the exact bound for a cubic -- and outside it is the plain distance to the nearer end,
+// since the perpendicular alone would understate a curve that doubles back.
+private reach(q: Point, a: Point, d: Point) -> f64
+    val dx = d.x - a.x
+    val dy = d.y - a.y
+    val len2 = dx * dx + dy * dy
+    val qx = q.x - a.x
+    val qy = q.y - a.y
+    if !(len2 > 0.0)
+        return qx.hypot(qy)
+    val t = (qx * dx + qy * dy) / len2
+    if t < 0.0
+        return qx.hypot(qy)
+    if t > 1.0
+        return (q.x - d.x).hypot(q.y - d.y)
+    ((qx * dy - qy * dx) / len2.sqrt()).abs() * 0.75
+end reach
+
+private mid(a: Point, b: Point) -> Point = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+
+// Appends the vertices of the cubic after its start point, splitting at the middle until both
+// control points are within `tol` of the chord. A cubic whose measure is NaN is taken as flat, so
+// bad input ends the recursion instead of fanning out; `depth` ends it for a tolerance finer than a
+// float can resolve.
+private flatten_cubic(out: Buf[Point], a: Point, b: Point, c1: Point, d: Point, tol: f64, depth: int)
+    val dev = max(reach(b, a, d), reach(c1, a, d))
+    if depth >= 16 || !(dev > tol)
+        out.push(d)
+        return
+    val ab = mid(a, b)
+    val bc = mid(b, c1)
+    val cd = mid(c1, d)
+    val abc = mid(ab, bc)
+    val bcd = mid(bc, cd)
+    val m = mid(abc, bcd)
+    flatten_cubic(out, a, ab, abc, m, tol, depth + 1)
+    flatten_cubic(out, m, bcd, cd, d, tol, depth + 1)
+end flatten_cubic
+
+private same(a: Point, b: Point) -> bool = a.x == b.x && a.y == b.y
+
+// Flattens one path.
+//
+// Every vertex of the result is within `tolerance` of the true curve and the curve within it of the
+// polyline, in whatever units the image was parsed in -- so a tolerance of `0.01` on a `Units.Mm`
+// image is a hundredth of a millimetre. **It is adaptive**: a segment splits only where it bends,
+// so a straight line stays one edge and a tight corner gets many.
+//
+// **A tolerance finer than a float can say is raised to what one can**: nanosvg stores `f32`, so
+// anything below about a ten-millionth of the path's largest coordinate would only ask for
+// thousands of points describing rounding error. A tolerance that is not a positive number is
+// `BadTolerance`.
+flatten_path(path: Path, tolerance: f64) -> Result[Outline, Error]
+    if !(tolerance > 0.0) then return Err(BadTolerance)
+
+    val bb = path.bounds()
+    val extent = max(max(f64(bb.min_x).abs(), f64(bb.max_x).abs()), max(f64(bb.min_y).abs(), f64(bb.max_y).abs()))
+    val tol = if extent < 1.0e300 then max(tolerance, extent * 1.2e-7) else tolerance
+
+    var raw: Buf[Point] = buf()
+    val n = path.segments()
+    if n > 0
+        raw.push(path.point(0))
+        for i in 0..<n
+            val s = path.bezier(i)
+            flatten_cubic(raw, s.p0, s.p1, s.p2, s.p3, tol, 0)
+
+    // Drop zero-length edges, and for a closed path the repeat of the start that nanosvg appends.
+    var points: Buf[Point] = buf()
+    for i in 0..<raw.len()
+        if points.is_empty() || !same(points[points.len() - 1], raw[i])
+            points.push(raw[i])
+    val closed = path.closed()
+    if closed && points.len() > 1 && same(points[0], points[points.len() - 1])
+        points.pop()
+    Ok(Outline(points, closed))
+end flatten_path
