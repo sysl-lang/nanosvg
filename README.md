@@ -31,7 +31,7 @@ outline_points(text: string) -> Result[usize, Error]
 
 ```hocon
 dependencies {
-  nanosvg { git = "github.com/sysl-lang/nanosvg", version = "0.1.0" }
+  nanosvg { git = "github.com/sysl-lang/nanosvg", version = "0.1.1" }
 }
 ```
 

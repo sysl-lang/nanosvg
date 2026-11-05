@@ -2,7 +2,6 @@ module sh.sysl.nanosvg
 
 import sh.sysl.nanosvg.c
 import sysl.buf.{Buf, buf}
-import sysl.math.max
 import sysl.slices.as_mut_ptr
 import sysl.text.from_cstring
 
@@ -407,7 +406,7 @@ private mid(a: Point, b: Point) -> Point = Point((a.x + b.x) / 2.0, (a.y + b.y) 
 // bad input ends the recursion instead of fanning out; `depth` ends it for a tolerance finer than a
 // float can resolve.
 private flatten_cubic(out: Buf[Point], a: Point, b: Point, c1: Point, d: Point, tol: f64, depth: int)
-    val dev = max(reach(b, a, d), reach(c1, a, d))
+    val dev = reach(b, a, d).max(reach(c1, a, d))
     if depth >= 16 || !(dev > tol)
         out.push(d)
         return
@@ -438,8 +437,8 @@ flatten_path(path: Path, tolerance: f64) -> Result[Outline, Error]
     if !(tolerance > 0.0) then return Err(BadTolerance)
 
     val bb = path.bounds()
-    val extent = max(max(f64(bb.min_x).abs(), f64(bb.max_x).abs()), max(f64(bb.min_y).abs(), f64(bb.max_y).abs()))
-    val tol = if extent < 1.0e300 then max(tolerance, extent * 1.2e-7) else tolerance
+    val extent = f64(bb.min_x).abs().max(f64(bb.max_x).abs()).max(f64(bb.min_y).abs().max(f64(bb.max_y).abs()))
+    val tol = if extent < 1.0e300 then tolerance.max(extent * 1.2e-7) else tolerance
 
     var raw: Buf[Point] = buf()
     val n = path.segments()

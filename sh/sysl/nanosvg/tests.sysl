@@ -2,7 +2,7 @@ module sh.sysl.nanosvg
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.math.{max, min}
+import sysl.math.min
 
 // What this binding claims, run by `sysl test .`.
 //
@@ -21,7 +21,7 @@ import sysl.math.{max, min}
 
 private near(a: f64, b: f64, tol: f64) -> bool = (a - b).abs() <= tol
 
-private near_rel(a: f64, b: f64, rel: f64) -> bool = (a - b).abs() <= rel * max(a.abs(), b.abs())
+private near_rel(a: f64, b: f64, rel: f64) -> bool = (a - b).abs() <= rel * a.abs().max(b.abs())
 
 // A document with an explicit size and viewBox, so the user units are the pixels and nothing is
 // re-centred on the content.
@@ -195,8 +195,8 @@ hole()
     // Both squares are wound the same way: 80 x 80 and 40 x 40.
     val a0 = outs[0].area().abs()
     val a1 = outs[1].area().abs()
-    assert(near(max(a0, a1), 6400.0, 0.01))
-    assert(near(min(a0, a1), 1600.0, 0.01))
+    assert(near(a0.max(a1), 6400.0, 0.01))
+    assert(near(a0.min(a1), 1600.0, 0.01))
     assert((outs[0].area() > 0.0) == (outs[1].area() > 0.0))
     assert(outs[0].closed && outs[1].closed)
 
@@ -517,7 +517,7 @@ within_tolerance_of_the_curve()
                     val u = 1.0 - t
                     val x = u * u * u * c.p0.x + 3.0 * u * u * t * c.p1.x + 3.0 * u * t * t * c.p2.x + t * t * t * c.p3.x
                     val y = u * u * u * c.p0.y + 3.0 * u * u * t * c.p1.y + 3.0 * u * t * t * c.p2.y + t * t * t * c.p3.y
-                    worst = max(worst, distance_to_polyline(x, y, o))
+                    worst = worst.max(distance_to_polyline(x, y, o))
             assert(worst <= tol * 1.000001, "the curve strays from its polyline: " + d)
 
 // Distance from (x, y) to the nearest edge of the polyline.
@@ -528,9 +528,9 @@ private distance_to_polyline(x: f64, y: f64, o: Outline) -> f64
         val a = o.points[i]
         if i + 1 < n || o.closed
             val b = o.points[(i + 1) % n]
-            best = min(best, distance_to_segment(x, y, a, b))
+            best = best.min(distance_to_segment(x, y, a, b))
         else if n == 1
-            best = min(best, (x - a.x).hypot(y - a.y))
+            best = best.min((x - a.x).hypot(y - a.y))
     best
 
 private distance_to_segment(x: f64, y: f64, a: Point, b: Point) -> f64
@@ -540,7 +540,7 @@ private distance_to_segment(x: f64, y: f64, a: Point, b: Point) -> f64
     var t = 0.0
     if len2 > 0.0
         t = ((x - a.x) * dx + (y - a.y) * dy) / len2
-    t = max(0.0, min(1.0, t))
+    t = t.clamp(0.0, 1.0)
     (x - (a.x + t * dx)).hypot(y - (a.y + t * dy))
 
 @test("flattening is adaptive: a straight line stays one edge and a bend gets many")
@@ -555,8 +555,8 @@ adaptive()
     var longest = 0.0
     for i in 0..<(curved.points.len() - 1)
         val e = (curved.points[i + 1].x - curved.points[i].x).hypot(curved.points[i + 1].y - curved.points[i].y)
-        shortest = min(shortest, e)
-        longest = max(longest, e)
+        shortest = shortest.min(e)
+        longest = longest.max(e)
     assert(longest > shortest * 1.2)
 
 @test("a tolerance finer than a float can resolve is raised, so the point count stays bounded")
