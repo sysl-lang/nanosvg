@@ -371,7 +371,7 @@ parse_bytes(data: []const u8, units: Units = Units.Px, dpi: f32 = 96) -> Result[
     text.extend(data)
     text.push(0)
 
-    val q = c.parse(as_mut_ptr(text.view()), units.code(), dpi)
+    val q = c.parse(as_mut_ptr(text.view_mut()), units.code(), dpi)
     if usize(q) == 0 then return Err(NoMemory)
 
     val per = units.pixels(dpi)
